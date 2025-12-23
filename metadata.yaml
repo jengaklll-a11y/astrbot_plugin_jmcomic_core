@@ -1,5 +1,6 @@
-name: jm_cosmos
-version: 1.1.0
-author: GEMILUXVII
+name: astrbot_plugin_jmcomic_core
+display_name: JMcomic(Core)
+version: 1.0.0
+author: jengaklll-a11y
 description: 下载JM漫画并转为PDF，支持预览搜索测试和更新可用域名，新增三层下载回退机制和优化作者搜索
-repo: https://github.com/GEMILUXVII/astrbot_plugin_jm_cosmos
+repo: https://github.com/jengaklll-a11y/astrbot_plugin_jmcomic_core
