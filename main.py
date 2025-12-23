@@ -1,128 +1,114 @@
+import os
+import yaml
+import json
 import time
-import requests
-from astrbot.api.all import *
+import logging
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any, Tuple
+from pathlib import Path
+from astrbot.api.star import StarTools
 
-@register("astrbot_plugin_jmcomic_core", "jengaklll-a11y", "精简版 JMcomic 插件", "1.0.0")
-class Main(Star):
-    def __init__(self, context: Context, config: dict):
-        super().__init__(context)
-        self.config = config
-        self.client_id = self.config.get("client_id")
-        self.client_secret = self.config.get("client_secret")
-        self.access_token = None
-        self.token_expires = 0
-        self.base_url = "https://api.jm.cosmos.link"
+logger = logging.getLogger("astrbot")
 
-    def _get_token(self):
-        """内部方法：获取或刷新 Access Token"""
-        if self.access_token and time.time() < self.token_expires:
-            return self.access_token
+@dataclass
+class CosmosConfig:
+    """Cosmos插件配置类"""
+    domain_list: List[str]
+    proxy: Optional[str]
+    avs_cookie: str
+    max_threads: int
+    debug_mode: bool
+    show_cover: bool
 
-        url = f"{self.base_url}/oauth2/token"
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> "CosmosConfig":
+        return cls(
+            domain_list=config_dict.get("domain_list", ["18comic.vip", "jm365.xyz", "18comic.org"]),
+            proxy=config_dict.get("proxy"),
+            avs_cookie=config_dict.get("avs_cookie", ""),
+            max_threads=int(config_dict.get("max_threads", 10)),
+            debug_mode=bool(config_dict.get("debug_mode", False)),
+            show_cover=bool(config_dict.get("show_cover", True)),
+        )
+
+class ResourceManager:
+    """资源管理器，管理文件路径和创建必要的目录"""
+
+    def __init__(self, plugin_name: str):
+        self.base_dir = Path(StarTools.get_data_dir(plugin_name))
+        self.downloads_dir = self.base_dir / "downloads"
+        self.pdfs_dir = self.base_dir / "pdfs"
+        self.logs_dir = self.base_dir / "logs"
+        self.temp_dir = self.base_dir / "temp"
+        self.covers_dir = self.base_dir / "covers"
+        
+        self.max_storage_size = 2 * 1024 * 1024 * 1024  # 2GB
+        self.max_file_age_days = 30
+
+        # 创建目录
+        for dir_path in [self.downloads_dir, self.pdfs_dir, self.logs_dir, self.temp_dir, self.covers_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+    def check_storage_space(self) -> Tuple[bool, int]:
+        total_size = sum(f.stat().st_size for f in self.base_dir.rglob('*') if f.is_file())
+        return total_size < self.max_storage_size, total_size
+
+    def cleanup_old_files(self) -> int:
+        cutoff_time = time.time() - (self.max_file_age_days * 86400)
+        cleaned_count = 0
+        for file_path in self.base_dir.rglob('*'):
+            if file_path.is_file() and file_path.stat().st_mtime < cutoff_time:
+                try:
+                    file_path.unlink()
+                    cleaned_count += 1
+                except Exception as e:
+                    logger.error(f"清理文件失败 {file_path}: {e}")
+        return cleaned_count
+
+    def get_storage_info(self) -> dict:
+        has_space, total_size = self.check_storage_space()
+        return {
+            "total_size_mb": round(total_size / (1024 * 1024), 2),
+            "max_size_mb": round(self.max_storage_size / (1024 * 1024), 2),
+            "has_space": has_space,
+            "usage_percent": round((total_size / self.max_storage_size) * 100, 2),
         }
-        try:
-            self.context.logger.info("正在刷新 JM Cosmos Access Token...")
-            response = requests.post(url, data=data, timeout=10)
-            response.raise_for_status()
-            token_data = response.json()
-            self.access_token = token_data["access_token"]
-            # 提前 60 秒认为过期，防止临界点请求失败
-            self.token_expires = time.time() + token_data["expires_in"] - 60
-            self.context.logger.info("Access Token 刷新成功。")
-            return self.access_token
-        except Exception as e:
-            self.context.logger.error(f"获取 Token 失败: {e}")
-            raise Exception("身份验证失败，请检查 client_id 和 client_secret 是否正确。")
 
-    def _request(self, method, endpoint, **kwargs):
-        """内部方法：统一的 HTTP 请求处理"""
-        if not self.client_id or not self.client_secret:
-             raise Exception("未配置 client_id 或 client_secret，请先在配置中填写。")
+    def get_comic_folder(self, comic_id: str) -> Path:
+        """查找漫画文件夹，支持多种命名方式"""
+        # 1. 尝试直接 ID 匹配
+        id_path = self.downloads_dir / str(comic_id)
+        if id_path.exists():
+            return id_path
 
-        token = self._get_token()
-        url = f"{self.base_url}{endpoint}"
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {token}"
-        # 设置默认超时
-        kwargs.setdefault("timeout", 15)
+        # 2. 尝试模糊匹配
+        if self.downloads_dir.exists():
+            for item in self.downloads_dir.iterdir():
+                if not item.is_dir(): continue
+                # 精确格式匹配
+                if (item.name.startswith(f"{comic_id}_") or 
+                    item.name.endswith(f"_{comic_id}") or 
+                    item.name.startswith(f"[{comic_id}]") or 
+                    item.name == str(comic_id)):
+                    return item
+        
+        # 默认返回
+        return id_path
 
-        try:
-            response = requests.request(method, url, headers=headers, **kwargs)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("code") == 200:
-                return data.get("data")
-            else:
-                raise Exception(f"API 错误 [{data.get('code')}]: {data.get('msg')}")
-        except requests.exceptions.RequestException as e:
-            self.context.logger.error(f"网络请求失败: {e}")
-            raise Exception(f"网络请求失败: {e}")
-        except Exception as e:
-            self.context.logger.error(f"请求处理失败: {e}")
-            raise
+    def get_cover_path(self, comic_id: str) -> str:
+        return str(self.covers_dir / f"{comic_id}.jpg")
 
-    @command("jm搜")
-    async def jm_search(self, event: AstrMessageEvent, query: str):
-        """搜索 JM Cosmos 资源。用法：/jm搜 <关键词>"""
-        if not query:
-            yield event.plain_result("请输入搜索关键词。")
-            return
+    def get_pdf_path(self, comic_id: str) -> str:
+        return str(self.pdfs_dir / f"{comic_id}.pdf")
 
-        try:
-            # 仅调用搜索 API，不再嵌套调用详情 API
-            data = self._request("GET", "/search", params={"cn": query})
-            content = data.get("content", [])
-            if not content:
-                yield event.plain_result("未找到相关资源。")
-                return
-
-            msg = ["搜索结果："]
-            for item in content:
-                # 仅展示搜索结果中直接可用的信息
-                msg.append(f"ID: {item.get('id')} | 标题: {item.get('title')} | 作者: {item.get('author')}")
-            
-            yield event.plain_result("\n".join(msg))
-
-        except Exception as e:
-            yield event.plain_result(f"搜索失败：{e}")
-
-    @command("jm看")
-    async def jm_detail(self, event: AstrMessageEvent, resource_id: str):
-        """查看资源详情。用法：/jm看 <资源ID>"""
-        if not resource_id:
-            yield event.plain_result("请输入资源 ID。")
-            return
-
-        try:
-            data = self._request("GET", f"/detail/{resource_id}")
-            if not data:
-                 yield event.plain_result("未找到该资源详情。")
-                 return
-
-            # 数据处理
-            tags = ", ".join([tag["name"] for tag in data.get("tags", [])]) if data.get("tags") else "无"
-            works = ", ".join([work["name"] for work in data.get("works", [])]) if data.get("works") else "无"
-            description = data.get('des', '无描述')
-            
-            # 构建图文消息链
-            msg_chain = [
-                Plain(f"标题：{data.get('title')}\n"),
-                Plain(f"作者：{data.get('author')}\n"),
-                Plain(f"标签：{tags}\n"),
-                Plain(f"作品来源：{works}\n"),
-                Plain(f"描述：{description}\n"),
-            ]
-            
-            cover_url = data.get("cover")
-            if cover_url:
-                # 将封面图放在最前面
-                msg_chain.insert(0, Image.fromURL(cover_url))
-
-            yield event.chain_result(msg_chain)
-
-        except Exception as e:
-            yield event.plain_result(f"获取详情失败：{e}")
+    def clear_cover_cache(self) -> int:
+        count = 0
+        if self.covers_dir.exists():
+            for f in self.covers_dir.iterdir():
+                if f.is_file():
+                    try:
+                        f.unlink()
+                        count += 1
+                    except Exception:
+                        pass
+        return count
