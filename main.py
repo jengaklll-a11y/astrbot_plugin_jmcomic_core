@@ -2,7 +2,7 @@ import time
 import requests
 from astrbot.api.all import *
 
-@register("jm_cosmos", "Oasis Akari", "精简版 JM Cosmos 插件", "1.0.2")
+@register("astrbot_plugin_jmcomic_core", "jengaklll-a11y", "精简版 JMcomic 插件", "1.0.0")
 class Main(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
